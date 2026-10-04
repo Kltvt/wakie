@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Walkie Talkie</title>
+<style>
+  :root { --bg:#14161a; --card:#1e2127; --text:#e8eaed; --muted:#8b9099; --accent:#34d399; --hot:#ef4444; }
+  * { box-sizing: border-box; }
+  body { margin:0; min-height:100vh; display:grid; place-items:center; background:var(--bg); color:var(--text); font-family: system-ui, sans-serif; }
+  .card { background:var(--card); padding:28px; border-radius:16px; width:min(92vw,380px); text-align:center; }
+  h1 { margin:0 0 18px; font-size:1.4rem; }
+  input { width:100%; padding:12px; margin-bottom:10px; border-radius:8px; border:1px solid #333; background:#111; color:var(--text); font-size:1rem; }
+  button.join { width:100%; padding:12px; border:0; border-radius:8px; background:var(--accent); color:#04120c; font-weight:600; font-size:1rem; cursor:pointer; }
+  #talk { width:170px; height:170px; border-radius:50%; border:0; margin:20px auto; display:block; background:var(--accent); color:#04120c; font-size:1.1rem; font-weight:700; cursor:pointer; user-select:none; touch-action:none; transition:transform .08s; }
+  #talk.active { background:var(--hot); color:#fff; transform:scale(.95); }
+  #status, #roster { color:var(--muted); font-size:.9rem; min-height:1.3em; }
+  .hidden { display:none; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>📻 Walkie Talkie</h1>
+
+  <div id="join">
+    <input id="name" placeholder="Your name" maxlength="20">
+    <input id="room" placeholder="Room code (share with friends)" maxlength="32">
+    <button class="join" id="joinBtn">Join room</button>
+  </div>
+
+  <div id="main" class="hidden">
+    <div id="roster"></div>
+    <button id="talk">HOLD TO TALK</button>
+    <div id="status">Hold the button or the spacebar</div>
+  </div>
+</div>
+
+<div id="audioSink" class="hidden"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const ICE = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+const IDLE_TEXT = "Hold the button or the spacebar";
+
+let ws, myId, stream, talking = false;
+const peers = new Map(); // peerId -> { name, pc, audio, pendingIce: [] }
+
+$("joinBtn").onclick = async () => {
+  const name = $("name").value.trim() || "Anon";
+  const room = $("room").value.trim();
+  if (!room) return alert("Enter a room code");
+
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+  } catch (e) {
+    return alert("Microphone access is needed (and the page must be on localhost or HTTPS).");
+  }
+  // Push-to-talk: the mic stays muted until the button is held.
+  stream.getAudioTracks().forEach((t) => (t.enabled = false));
+
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${proto}://${location.host}`);
+  ws.onopen = () => ws.send(JSON.stringify({ type: "join", name, room }));
+  ws.onmessage = (ev) => onMessage(JSON.parse(ev.data), name);
+  ws.onclose = () => { $("status").textContent = "Disconnected. Refresh to rejoin."; };
+};
+
+async function onMessage(msg, myName) {
+  switch (msg.type) {
+    case "welcome":
+      myId = msg.id;
+      $("join").classList.add("hidden");
+      $("main").classList.remove("hidden");
+      // The newcomer is the one who calls everyone already in the room.
+      for (const p of msg.peers) {
+        const peer = createPeer(p.id, p.name);
+        const offer = await peer.pc.createOffer();
+        await peer.pc.setLocalDescription(offer);
+        signal(p.id, { sdp: peer.pc.localDescription });
+      }
+      renderRoster(myName);
+      break;
+
+    case "peer-joined":
+      // Existing members just wait for the newcomer's offer.
+      createPeer(msg.id, msg.name);
+      renderRoster(myName);
+      break;
+
+    case "peer-left":
+      closePeer(msg.id);
+      renderRoster(myName);
+      break;
+
+    case "signal":
+      await onSignal(msg.from, msg.data);
+      break;
+
+    case "talking":
+      $("status").textContent = msg.on ? `🔊 ${msg.name} is talking…` : IDLE_TEXT;
+      break;
+  }
+}
+
+function signal(to, data) {
+  ws.send(JSON.stringify({ type: "signal", to, data }));
+}
+
+function createPeer(id, name) {
+  if (peers.has(id)) return peers.get(id);
+
+  const pc = new RTCPeerConnection(ICE);
+  const audio = document.createElement("audio");
+  audio.autoplay = true;
+  audio.playsInline = true;
+  $("audioSink").appendChild(audio);
+
+  const peer = { name, pc, audio, pendingIce: [] };
+  peers.set(id, peer);
+
+  stream.getTracks().forEach((t) => pc.addTrack(t, stream));
+  pc.ontrack = (ev) => { audio.srcObject = ev.streams[0]; audio.play().catch(() => {}); };
+  pc.onicecandidate = (ev) => { if (ev.candidate) signal(id, { candidate: ev.candidate }); };
+  return peer;
+}
+
+async function onSignal(from, data) {
+  const peer = peers.get(from);
+  if (!peer) return;
+  const { pc } = peer;
+
+  if (data.sdp) {
+    await pc.setRemoteDescription(data.sdp);
+    // Candidates that arrived before the description can be applied now.
+    for (const c of peer.pendingIce.splice(0)) await pc.addIceCandidate(c).catch(() => {});
+    if (data.sdp.type === "offer") {
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      signal(from, { sdp: pc.localDescription });
+    }
+  } else if (data.candidate) {
+    if (pc.remoteDescription) await pc.addIceCandidate(data.candidate).catch(() => {});
+    else peer.pendingIce.push(data.candidate);
+  }
+}
+
+function closePeer(id) {
+  const peer = peers.get(id);
+  if (!peer) return;
+  peer.pc.close();
+  peer.audio.remove();
+  peers.delete(id);
+}
+
+function renderRoster(myName) {
+  const names = [myName + " (you)", ...[...peers.values()].map((p) => p.name)];
+  $("roster").textContent = "In room: " + names.join(", ");
+}
+
+function setTalking(on) {
+  stream.getAudioTracks().forEach((t) => (t.enabled = on));
+  ws.send(JSON.stringify({ type: "talking", on }));
+  $("talk").classList.toggle("active", on);
+  $("talk").textContent = on ? "TALKING…" : "HOLD TO TALK";
+}
+
+function startTalk() {
+  if (talking || !stream || !myId) return;
+  talking = true;
+  setTalking(true);
+}
+
+function stopTalk() {
+  if (!talking) return;
+  talking = false;
+  setTalking(false);
+}
+
+const btn = $("talk");
+btn.addEventListener("pointerdown", (e) => { e.preventDefault(); btn.setPointerCapture(e.pointerId); startTalk(); });
+btn.addEventListener("pointerup", stopTalk);
+btn.addEventListener("pointercancel", stopTalk);
+window.addEventListener("blur", stopTalk);
+window.addEventListener("keydown", (e) => {
+  if (e.code === "Space" && !e.repeat && !$("main").classList.contains("hidden")) { e.preventDefault(); startTalk(); }
+});
+window.addEventListener("keyup", (e) => { if (e.code === "Space") stopTalk(); });
+</script>
+</body>
+</html>

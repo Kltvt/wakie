@@ -1,0 +1,16 @@
+{
+  "name": "walkie-talkie",
+  "version": "1.0.0",
+  "description": "Push-to-talk walkie-talkie web app for friends",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "ws": "^8.18.0"
+  }
+}
