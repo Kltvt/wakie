@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: walkie-talkie
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
